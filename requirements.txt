@@ -1,5 +1,6 @@
-crewai
-openai
-python-dotenv
+langgraph
+langchain
+langchain-openai
 fastapi
-uvicorn
+uvicorn[standard]
+python-dotenv
