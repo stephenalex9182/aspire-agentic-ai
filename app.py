@@ -3,7 +3,7 @@ LLM initialized successfully.
 LangGraph compiled successfully.
 
 ======================================================================
-🏠 REAL ESTATE MULTI-AGENT AI
+ REAL ESTATE MULTI-AGENT AI
 ======================================================================
 
 Starting agents...
