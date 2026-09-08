@@ -1,204 +1,266 @@
 import os
-import io
 import json
 import traceback
 from typing import TypedDict, List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import yfinance as yf
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # ==========================================
-# 1. INITIALIZATION & ENV CONFIG
+# 1. INITIALIZATION
 # ==========================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY environment variable is not set.")
-
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
+    model="gemini-2.5-flash",
     google_api_key=GEMINI_API_KEY,
-    temperature=0.2
+    temperature=0.3
 )
 
+# In-memory session store for chat history
+session_histories: Dict[str, List[BaseMessage]] = {}
+
 # ==========================================
-# 2. STATE DEFINITION
+# 2. STATE & TOOLS
 # ==========================================
-class FinancialState(TypedDict):
-    ticker: str
-    target_concern: Optional[str]
+class FinancialChatState(TypedDict):
+    messages: List[BaseMessage]
+    ticker: Optional[str]
     financial_data: Optional[Dict[str, Any]]
-    analysis_report: Optional[str]
-    risk_assessment: Optional[str]
-    final_verdict: Optional[str]
+    final_response: Optional[str]
 
-# ==========================================
-# 3. TOOLS
-# ==========================================
 @tool
-def fetch_ticker_fundamentals(ticker: str) -> Dict[str, Any]:
-    """Fetches fundamental financial metrics and recent ratios using Yahoo Finance."""
+def fetch_ticker_data(ticker: str) -> Dict[str, Any]:
+    """Fetches key valuation, margin, and market metrics for a stock ticker."""
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker.strip().upper())
         info = stock.info
-        
-        extracted = {
+        return {
             "symbol": ticker.upper(),
-            "shortName": info.get("shortName", "N/A"),
-            "sector": info.get("sector", "N/A"),
-            "currentPrice": info.get("currentPrice") or info.get("regularMarketPrice"),
-            "marketCap": info.get("marketCap"),
-            "peRatio": info.get("trailingPE"),
-            "forwardPE": info.get("forwardPE"),
-            "pegRatio": info.get("pegRatio"),
-            "profitMargins": info.get("profitMargins"),
-            "operatingMargins": info.get("operatingMargins"),
-            "debtToEquity": info.get("debtToEquity"),
-            "freeCashflow": info.get("freeCashflow"),
-            "recommendationKey": info.get("recommendationKey", "N/A"),
-            "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
-            "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
+            "name": info.get("shortName", "N/A"),
+            "price": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "pe_ratio": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "market_cap": info.get("marketCap"),
+            "debt_to_equity": info.get("debtToEquity"),
+            "free_cash_flow": info.get("freeCashflow"),
+            "profit_margins": info.get("profitMargins"),
+            "target_high": info.get("targetHighPrice"),
+            "recommendation": info.get("recommendationKey", "N/A"),
         }
-        return extracted
     except Exception as e:
-        return {"error": f"Failed to fetch data for {ticker}: {str(e)}"}
+        return {"error": f"Failed fetching data for {ticker}: {str(e)}"}
 
 # ==========================================
-# 4. GRAPH NODES
+# 3. GRAPH NODES
 # ==========================================
-def market_data_fetcher_node(state: FinancialState):
-    ticker = state["ticker"]
-    metrics = fetch_ticker_fundamentals.invoke(ticker)
-    return {"financial_data": metrics}
-
-def financial_analyst_node(state: FinancialState):
-    ticker = state["ticker"]
-    data = state.get("financial_data", {})
-    concern = state.get("target_concern") or "General valuation and fundamentals"
-
-    prompt = f"""
-    You are a Senior Wall Street Equity Research Analyst.
-    Evaluate the following financial fundamentals for {ticker}:
-    Data: {json.dumps(data, indent=2)}
-
-    Primary Investor Concern/Focus: {concern}
-
-    Provide a concise fundamental analysis report covering:
-    1. Valuation (P/E, Forward P/E, PEG)
-    2. Capital Structure & Health (Debt to Equity, Free Cash Flow)
-    3. Operational Efficiency (Margins)
-    Format clearly in Markdown.
-    """
-    response = llm.invoke(prompt)
-    report_text = response.content if hasattr(response, "content") else str(response)
-    return {"analysis_report": report_text}
-
-def risk_officer_node(state: FinancialState):
-    data = state.get("financial_data", {})
-    analysis = state.get("analysis_report", "")
-
-    prompt = f"""
-    You are a Chief Risk Officer (CRO). Review this financial analysis and metrics:
-    Metrics: {json.dumps(data, indent=2)}
-    Analyst Report: {analysis}
-
-    Identify:
-    1. Top 3 downside risk factors (liquidity, leverage, industry headwinds, valuation multiple contraction).
-    2. Stress points or red flags.
-    Return a structured risk assessment in Markdown.
-    """
-    response = llm.invoke(prompt)
-    risk_text = response.content if hasattr(response, "content") else str(response)
-    return {"risk_assessment": risk_text}
-
-def portfolio_manager_node(state: FinancialState):
-    analysis = state.get("analysis_report", "")
-    risks = state.get("risk_assessment", "")
-
-    prompt = f"""
-    You are the Lead Portfolio Manager making the final capital allocation decision.
-    Based on:
-    - Fundamental Analysis: {analysis}
-    - Risk Audit: {risks}
-
-    Provide:
-    1. Rating: [BULLISH / NEUTRAL / BEARISH]
-    2. Conviction Level: [LOW / MEDIUM / HIGH]
-    3. Final Allocation Verdict (2-3 sentences explaining rationale).
-    """
-    response = llm.invoke(prompt)
-    verdict_text = response.content if hasattr(response, "content") else str(response)
-    return {"final_verdict": verdict_text}
-
-# ==========================================
-# 5. GRAPH CONSTRUCTION
-# ==========================================
-workflow = StateGraph(FinancialState)
-
-workflow.add_node("data_fetcher", market_data_fetcher_node)
-workflow.add_node("equity_analyst", financial_analyst_node)
-workflow.add_node("risk_officer", risk_officer_node)
-workflow.add_node("portfolio_manager", portfolio_manager_node)
-
-workflow.add_edge(START, "data_fetcher")
-workflow.add_edge("data_fetcher", "equity_analyst")
-workflow.add_edge("equity_analyst", "risk_officer")
-workflow.add_edge("risk_officer", "portfolio_manager")
-workflow.add_edge("portfolio_manager", END)
-
-app_graph = workflow.compile()
-
-# ==========================================
-# 6. FASTAPI WEB SERVER (FOR RENDER)
-# ==========================================
-api = FastAPI(
-    title="Financial Analyzer Agent API",
-    description="Multi-agent financial assessment system powered by LangGraph and Gemini",
-    version="1.0.0"
-)
-
-class AnalyzeRequest(BaseModel):
-    ticker: str
-    concern: Optional[str] = "Evaluate valuation and short-to-medium term risk."
-
-@api.get("/")
-def health_check():
-    return {"status": "online", "message": "Financial Analyzer Agent is active."}
-
-@api.post("/analyze")
-def run_analysis(request: AnalyzeRequest):
-    if not request.ticker:
-        raise HTTPException(status_code=400, detail="Ticker symbol must be provided.")
+def extract_intent_node(state: FinancialChatState):
+    """Extracts whether a ticker symbol is mentioned in the user conversation."""
+    last_user_msg = [m.content for m in state["messages"] if isinstance(m, HumanMessage)][-1]
     
-    initial_state: FinancialState = {
-        "ticker": request.ticker.strip().upper(),
-        "target_concern": request.concern,
+    extract_prompt = f"""
+    Given this user message: "{last_user_msg}"
+    Determine if the user is asking about a specific publicly traded company/stock.
+    If yes, return ONLY the ticker symbol (e.g. AAPL, TSLA, NVDA, RELIANCE.NS).
+    If no specific stock is mentioned or it's a general question/greeting, return 'NONE'.
+    Do not output any markdown or punctuation, just the ticker or NONE.
+    """
+    res = llm.invoke(extract_prompt).content.strip().upper()
+    ticker = None if "NONE" in res or len(res) > 12 else res
+    return {"ticker": ticker}
+
+def data_retrieval_node(state: FinancialChatState):
+    """Fetches real-time financial metrics if a ticker was detected."""
+    ticker = state.get("ticker")
+    if ticker:
+        data = fetch_ticker_data.invoke(ticker)
+        return {"financial_data": data}
+    return {"financial_data": None}
+
+def analyst_chat_node(state: FinancialChatState):
+    """Generates the conversational financial answer."""
+    data = state.get("financial_data")
+    ticker = state.get("ticker")
+
+    system_instruction = (
+        "You are an expert AI Financial Analyst and Portfolio Assistant. "
+        "Engage conversationally, clearly explaining fundamentals (PE ratio, debt, margins, cash flows), "
+        "highlighting key financial risks, and answering user follow-up questions accurately. "
+        "Keep answers crisp, insightful, and formatted cleanly in Markdown."
+    )
+
+    if data and "error" not in data:
+        context = f"\n[Real-time fundamental metrics for {ticker}: {json.dumps(data)}]"
+    else:
+        context = ""
+
+    augmented_messages = [SystemMessage(content=system_instruction + context)] + state["messages"]
+    bot_reply = llm.invoke(augmented_messages)
+    reply_text = bot_reply.content if hasattr(bot_reply, "content") else str(bot_reply)
+
+    return {
+        "final_response": reply_text,
+        "messages": state["messages"] + [AIMessage(content=reply_text)]
+    }
+
+# ==========================================
+# 4. WORKFLOW GRAPH
+# ==========================================
+workflow = StateGraph(FinancialChatState)
+workflow.add_node("extract_intent", extract_intent_node)
+workflow.add_node("data_retrieval", data_retrieval_node)
+workflow.add_node("analyst_chat", analyst_chat_node)
+
+workflow.add_edge(START, "extract_intent")
+workflow.add_edge("extract_intent", "data_retrieval")
+workflow.add_edge("data_retrieval", "analyst_chat")
+workflow.add_edge("analyst_chat", END)
+
+chat_graph = workflow.compile()
+
+# ==========================================
+# 5. FASTAPI APP & CHAT UI
+# ==========================================
+app = FastAPI(title="Financial Analyst Chatbot")
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = "default_user"
+
+@app.post("/chat")
+def chat_endpoint(payload: ChatRequest):
+    sid = payload.session_id
+    if sid not in session_histories:
+        session_histories[sid] = []
+
+    # Append current user message
+    session_histories[sid].append(HumanMessage(content=payload.message))
+
+    # Keep conversation history window manageable
+    recent_messages = session_histories[sid][-8:]
+
+    initial_state: FinancialChatState = {
+        "messages": recent_messages,
+        "ticker": None,
         "financial_data": None,
-        "analysis_report": None,
-        "risk_assessment": None,
-        "final_verdict": None
+        "final_response": None
     }
 
     try:
-        final_state = app_graph.invoke(initial_state)
+        output = chat_graph.invoke(initial_state)
+        # Persist assistant reply
+        session_histories[sid].append(AIMessage(content=output["final_response"]))
         return {
-            "ticker": final_state["ticker"],
-            "raw_fundamentals": final_state["financial_data"],
-            "equity_analysis": final_state["analysis_report"],
-            "risk_audit": final_state["risk_assessment"],
-            "portfolio_verdict": final_state["final_verdict"]
+            "reply": output["final_response"],
+            "ticker_analyzed": output.get("ticker"),
+            "data_snapshot": output.get("financial_data")
         }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/", response_class=HTMLResponse)
+def serve_chat_ui():
+    """Serves a clean, responsive chat web page directly from the root domain."""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Financial Analyst Agent</title>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; height: 100vh; display: flex; flex-direction: column; }
+            header { background: #1e293b; padding: 16px 24px; border-bottom: 1px solid #334155; font-size: 1.1rem; font-weight: 600; }
+            #chat-window { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+            .msg { max-width: 80%; padding: 14px 18px; border-radius: 12px; line-height: 1.6; word-break: break-word; font-size: 0.95rem; }
+            .user { align-self: flex-end; background: #2563eb; color: #ffffff; border-bottom-right-radius: 2px; }
+            .bot { align-self: flex-start; background: #1e293b; border: 1px solid #334155; border-bottom-left-radius: 2px; }
+            .bot p { margin-bottom: 8px; }
+            .bot ul, .bot ol { margin-left: 20px; margin-bottom: 8px; }
+            #input-container { padding: 16px 24px; background: #1e293b; border-top: 1px solid #334155; display: flex; gap: 12px; }
+            input { flex: 1; padding: 12px 16px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; color: #fff; outline: none; font-size: 1rem; }
+            input:focus { border-color: #3b82f6; }
+            button { padding: 12px 24px; background: #2563eb; border: none; border-radius: 8px; color: #fff; font-weight: 600; cursor: pointer; transition: 0.2s; }
+            button:hover { background: #1d4ed8; }
+            button:disabled { background: #475569; cursor: not-allowed; }
+        </style>
+    </head>
+    <body>
+        <header>📈 Financial Analyst Agent</header>
+        <div id="chat-window">
+            <div class="msg bot">Hello! I am your AI Financial Analyst. Ask me about any company fundamentals, valuation multiples, risk assessments, or stock tickers (e.g., <em>"Analyze NVDA's margins"</em> or <em>"Is AAPL valuation stretched?"</em>).</div>
+        </div>
+        <form id="input-container" onsubmit="sendMessage(event)">
+            <input id="prompt" type="text" placeholder="Ask financial question or ticker..." autocomplete="off" />
+            <button id="send-btn" type="submit">Send</button>
+        </form>
+
+        <script>
+            const sessionId = "session_" + Math.random().toString(36).substring(7);
+            const chatWin = document.getElementById('chat-window');
+            const promptInput = document.getElementById('prompt');
+            const sendBtn = document.getElementById('send-btn');
+
+            async function sendMessage(e) {
+                e.preventDefault();
+                const text = promptInput.value.trim();
+                if (!text) return;
+
+                // Add User Message
+                appendMessage(text, 'user');
+                promptInput.value = '';
+                promptInput.disabled = true;
+                sendBtn.disabled = true;
+
+                // Loading Indicator
+                const loader = appendMessage("Analyzing market data...", 'bot');
+
+                try {
+                    const res = await fetch('/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: text, session_id: sessionId })
+                    });
+                    const data = await res.json();
+                    loader.innerHTML = marked.parse(data.reply);
+                } catch (err) {
+                    loader.innerText = "Error: Failed to reach the analysis agent.";
+                } finally {
+                    promptInput.disabled = false;
+                    sendBtn.disabled = false;
+                    promptInput.focus();
+                    chatWin.scrollTop = chatWin.scrollHeight;
+                }
+            }
+
+            function appendMessage(content, role) {
+                const div = document.createElement('div');
+                div.className = 'msg ' + role;
+                if (role === 'user') {
+                    div.innerText = content;
+                } else {
+                    div.innerHTML = marked.parse(content);
+                }
+                chatWin.appendChild(div);
+                chatWin.scrollTop = chatWin.scrollHeight;
+                return div;
+            }
+        </script>
+    </body>
+    </html>
+    """
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:api", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
