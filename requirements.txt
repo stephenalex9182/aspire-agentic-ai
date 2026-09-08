@@ -1,6 +1,9 @@
-langgraph
-langchain
-langchain-openai
 fastapi
 uvicorn[standard]
-python-dotenv
+pydantic
+langchain-core
+langgraph
+langchain-google-genai
+google-generativeai
+yfinance
+pandas
