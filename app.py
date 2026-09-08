@@ -1,632 +1,204 @@
-# ============================================================
-# LANGGRAPH MULTI-AGENT REAL ESTATE AI
-# GOOGLE COLAB - COMPLETE SINGLE CELL
-# ============================================================
-
-# ------------------------------------------------------------
-# 1. INSTALL PACKAGES
-# -----------------------------------------------------------
-
-
-# ------------------------------------------------------------
-# 2. IMPORTS
-# ------------------------------------------------------------
-
 import os
-from typing import TypedDict
+import io
+import json
+import traceback
+from typing import TypedDict, List, Optional, Dict, Any
 
-from getpass import getpass
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import yfinance as yf
 
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
+from langchain_google_genai import ChatGoogleGenerativeAI
 
+# ==========================================
+# 1. INITIALIZATION & ENV CONFIG
+# ==========================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ------------------------------------------------------------
-# 3. OPENAI API KEY
-# ------------------------------------------------------------
+if not GEMINI_API_KEY:
+    print("Warning: GEMINI_API_KEY environment variable is not set.")
 
-if not os.environ.get("OPENAI_API_KEY"):
-
-    api_key = getpass("Enter your OpenAI API Key: ")
-
-    os.environ["OPENAI_API_KEY"] = api_key
-
-
-# ------------------------------------------------------------
-# 4. TEST API KEY
-# ------------------------------------------------------------
-
-if not os.environ.get("OPENAI_API_KEY"):
-
-    raise ValueError("OPENAI_API_KEY was not provided.")
-
-
-print("API key loaded successfully.")
-
-
-# ------------------------------------------------------------
-# 5. CREATE LLM
-# ------------------------------------------------------------
-
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash", 
+    google_api_key=GEMINI_API_KEY,
+    temperature=0.2
 )
 
-print("LLM initialized successfully.")
+# ==========================================
+# 2. STATE DEFINITION
+# ==========================================
+class FinancialState(TypedDict):
+    ticker: str
+    target_concern: Optional[str]
+    financial_data: Optional[Dict[str, Any]]
+    analysis_report: Optional[str]
+    risk_assessment: Optional[str]
+    final_verdict: Optional[str]
 
+# ==========================================
+# 3. TOOLS
+# ==========================================
+@tool
+def fetch_ticker_fundamentals(ticker: str) -> Dict[str, Any]:
+    """Fetches fundamental financial metrics and recent ratios using Yahoo Finance."""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        extracted = {
+            "symbol": ticker.upper(),
+            "shortName": info.get("shortName", "N/A"),
+            "sector": info.get("sector", "N/A"),
+            "currentPrice": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "marketCap": info.get("marketCap"),
+            "peRatio": info.get("trailingPE"),
+            "forwardPE": info.get("forwardPE"),
+            "pegRatio": info.get("pegRatio"),
+            "profitMargins": info.get("profitMargins"),
+            "operatingMargins": info.get("operatingMargins"),
+            "debtToEquity": info.get("debtToEquity"),
+            "freeCashflow": info.get("freeCashflow"),
+            "recommendationKey": info.get("recommendationKey", "N/A"),
+            "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
+            "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
+        }
+        return extracted
+    except Exception as e:
+        return {"error": f"Failed to fetch data for {ticker}: {str(e)}"}
 
-# ============================================================
-# 6. SHARED LANGGRAPH STATE
-# ============================================================
+# ==========================================
+# 4. GRAPH NODES
+# ==========================================
+def market_data_fetcher_node(state: FinancialState):
+    ticker = state["ticker"]
+    metrics = fetch_ticker_fundamentals.invoke(ticker)
+    return {"financial_data": metrics}
 
-class RealEstateState(TypedDict, total=False):
-
-    location: str
-    budget: float
-    property_type: str
-    bedrooms: int
-    down_payment: float
-
-    property_analysis: str
-    market_analysis: str
-    location_analysis: str
-    financial_analysis: str
-
-    final_report: str
-
-
-# ============================================================
-# 7. PROPERTY DATABASE
-# ============================================================
-
-PROPERTY_DATABASE = """
-PROPERTY 1
-Address: 123 Oak Street, Austin, Texas
-Price: $620,000
-Type: Single Family Home
-Bedrooms: 4
-Bathrooms: 3
-Area: 2350 sq ft
-Year Built: 2018
-Features: Garage, backyard, modern kitchen, solar panels
-
-PROPERTY 2
-Address: 456 Lake View Drive, Austin, Texas
-Price: $645,000
-Type: Single Family Home
-Bedrooms: 4
-Bathrooms: 2.5
-Area: 2500 sq ft
-Year Built: 2020
-Features: Large backyard, garage, smart home system
-
-PROPERTY 3
-Address: 789 Green Valley Road, Austin, Texas
-Price: $590,000
-Type: Single Family Home
-Bedrooms: 3
-Bathrooms: 2
-Area: 2100 sq ft
-Year Built: 2017
-Features: Garage, garden, renovated kitchen, quiet neighborhood
-
-PROPERTY 4
-Address: 321 Sunset Avenue, Austin, Texas
-Price: $680,000
-Type: Single Family Home
-Bedrooms: 4
-Bathrooms: 3
-Area: 2700 sq ft
-Year Built: 2021
-Features: Swimming pool, garage, modern interior, large backyard
-"""
-
-
-# ============================================================
-# 8. AGENT 1 - PROPERTY RESEARCH
-# ============================================================
-
-def property_agent(state: RealEstateState):
+def financial_analyst_node(state: FinancialState):
+    ticker = state["ticker"]
+    data = state.get("financial_data", {})
+    concern = state.get("target_concern") or "General valuation and fundamentals"
 
     prompt = f"""
-You are the Property Research Agent.
+    You are a Senior Wall Street Equity Research Analyst.
+    Evaluate the following financial fundamentals for {ticker}:
+    Data: {json.dumps(data, indent=2)}
 
-CLIENT REQUIREMENTS:
+    Primary Investor Concern/Focus: {concern}
 
-Location:
-{state["location"]}
-
-Maximum Budget:
-${state["budget"]:,.0f}
-
-Property Type:
-{state["property_type"]}
-
-Minimum Bedrooms:
-{state["bedrooms"]}
-
-
-AVAILABLE PROPERTY DATA:
-
-{PROPERTY_DATABASE}
-
-
-TASK:
-
-Analyze every property.
-
-Select properties that:
-
-1. Are within the client's budget.
-2. Match the requested property type.
-3. Have at least the required number of bedrooms.
-
-For each suitable property provide:
-
-- Address
-- Price
-- Bedrooms
-- Bathrooms
-- Area
-- Price per square foot
-- Year built
-- Features
-- Why it matches
-
-Do not invent information.
-Only use the supplied property data.
-"""
-
+    Provide a concise fundamental analysis report covering:
+    1. Valuation (P/E, Forward P/E, PEG)
+    2. Capital Structure & Health (Debt to Equity, Free Cash Flow)
+    3. Operational Efficiency (Margins)
+    Format clearly in Markdown.
+    """
     response = llm.invoke(prompt)
+    report_text = response.content if hasattr(response, "content") else str(response)
+    return {"analysis_report": report_text}
 
-    return {
-        "property_analysis": response.content
-    }
-
-
-# ============================================================
-# 9. AGENT 2 - MARKET ANALYSIS
-# ============================================================
-
-def market_agent(state: RealEstateState):
+def risk_officer_node(state: FinancialState):
+    data = state.get("financial_data", {})
+    analysis = state.get("analysis_report", "")
 
     prompt = f"""
-You are the Real Estate Market Analysis Agent.
+    You are a Chief Risk Officer (CRO). Review this financial analysis and metrics:
+    Metrics: {json.dumps(data, indent=2)}
+    Analyst Report: {analysis}
 
-CLIENT LOCATION:
-
-{state["location"]}
-
-
-PROPERTY RESEARCH AGENT RESULT:
-
-{state["property_analysis"]}
-
-
-ORIGINAL PROPERTY DATA:
-
-{PROPERTY_DATABASE}
-
-
-TASK:
-
-Compare the selected properties.
-
-Analyze:
-
-1. Asking price
-2. Price per square foot
-3. Property size
-4. Year built
-5. Number of bedrooms
-6. Number of bathrooms
-7. Features
-8. Overall value
-
-Identify:
-
-- Best value
-- Most expensive
-- Best price per square foot
-- Strongest overall option
-
-Do not invent real-time market statistics.
-
-Use only the supplied information.
-"""
-
+    Identify:
+    1. Top 3 downside risk factors (liquidity, leverage, industry headwinds, valuation multiple contraction).
+    2. Stress points or red flags.
+    Return a structured risk assessment in Markdown.
+    """
     response = llm.invoke(prompt)
+    risk_text = response.content if hasattr(response, "content") else str(response)
+    return {"risk_assessment": risk_text}
 
-    return {
-        "market_analysis": response.content
-    }
-
-
-# ============================================================
-# 10. AGENT 3 - LOCATION ANALYSIS
-# ============================================================
-
-def location_agent(state: RealEstateState):
+def portfolio_manager_node(state: FinancialState):
+    analysis = state.get("analysis_report", "")
+    risks = state.get("risk_assessment", "")
 
     prompt = f"""
-You are the Location Analysis Agent.
+    You are the Lead Portfolio Manager making the final capital allocation decision.
+    Based on:
+    - Fundamental Analysis: {analysis}
+    - Risk Audit: {risks}
 
-LOCATION:
-
-{state["location"]}
-
-
-PROPERTY ANALYSIS:
-
-{state["property_analysis"]}
-
-
-TASK:
-
-Evaluate the properties from a location and lifestyle
-perspective.
-
-Discuss:
-
-- Neighborhood characteristics if provided
-- Property surroundings if provided
-- Lifestyle suitability
-- Backyard/garden/pool/garage benefits
-- Potential advantages
-- Potential disadvantages
-
-IMPORTANT:
-
-Do not invent:
-
-- Crime statistics
-- School ratings
-- Transport statistics
-- Hospital distances
-- Walkability scores
-
-If information is unavailable, say:
-
-"Information not provided."
-
-Provide a clear comparison.
-"""
-
+    Provide:
+    1. Rating: [BULLISH / NEUTRAL / BEARISH]
+    2. Conviction Level: [LOW / MEDIUM / HIGH]
+    3. Final Allocation Verdict (2-3 sentences explaining rationale).
+    """
     response = llm.invoke(prompt)
+    verdict_text = response.content if hasattr(response, "content") else str(response)
+    return {"final_verdict": verdict_text}
 
-    return {
-        "location_analysis": response.content
+# ==========================================
+# 5. GRAPH CONSTRUCTION
+# ==========================================
+workflow = StateGraph(FinancialState)
+
+workflow.add_node("data_fetcher", market_data_fetcher_node)
+workflow.add_node("equity_analyst", financial_analyst_node)
+workflow.add_node("risk_officer", risk_officer_node)
+workflow.add_node("portfolio_manager", portfolio_manager_node)
+
+workflow.add_edge(START, "data_fetcher")
+workflow.add_edge("data_fetcher", "equity_analyst")
+workflow.add_edge("equity_analyst", "risk_officer")
+workflow.add_edge("risk_officer", "portfolio_manager")
+workflow.add_edge("portfolio_manager", END)
+
+app_graph = workflow.compile()
+
+# ==========================================
+# 6. FASTAPI WEB SERVER (FOR RENDER)
+# ==========================================
+api = FastAPI(
+    title="Financial Analyzer Agent API",
+    description="Multi-agent financial assessment system powered by LangGraph and Gemini",
+    version="1.0.0"
+)
+
+class AnalyzeRequest(BaseModel):
+    ticker: str
+    concern: Optional[str] = "Evaluate valuation and short-to-medium term risk."
+
+@api.get("/")
+def health_check():
+    return {"status": "online", "message": "Financial Analyzer Agent is active."}
+
+@api.post("/analyze")
+def run_analysis(request: AnalyzeRequest):
+    if not request.ticker:
+        raise HTTPException(status_code=400, detail="Ticker symbol must be provided.")
+    
+    initial_state: FinancialState = {
+        "ticker": request.ticker.strip().upper(),
+        "target_concern": request.concern,
+        "financial_data": None,
+        "analysis_report": None,
+        "risk_assessment": None,
+        "final_verdict": None
     }
 
-
-# ============================================================
-# 11. AGENT 4 - FINANCIAL ANALYSIS
-# ============================================================
-
-def finance_agent(state: RealEstateState):
-
-    prompt = f"""
-You are the Financial Analysis Agent.
-
-CLIENT:
-
-Budget:
-${state["budget"]:,.0f}
-
-Down Payment:
-{state["down_payment"]}%
-
-
-PROPERTY ANALYSIS:
-
-{state["property_analysis"]}
-
-
-TASK:
-
-Calculate the following for each selected property:
-
-1. Property price
-2. Down payment amount
-3. Loan amount
-4. Price per square foot
-5. Estimated monthly mortgage payment
-
-Mortgage assumptions:
-
-Annual interest rate = 6.5%
-
-Loan period = 30 years
-
-Use:
-
-Monthly rate = annual rate / 12
-
-Number of payments = 30 * 12
-
-Mortgage formula:
-
-M = P * r * (1+r)^n / ((1+r)^n - 1)
-
-where:
-
-P = loan amount
-r = monthly interest rate
-n = total number of payments
-
-Clearly state that mortgage calculations
-are estimates.
-
-Do not include:
-
-- Taxes
-- Insurance
-- HOA
-- Maintenance
-- Closing costs
-
-unless provided.
-
-Identify the strongest financial option.
-"""
-
-    response = llm.invoke(prompt)
-
-    return {
-        "financial_analysis": response.content
-    }
-
-
-# ============================================================
-# 12. FINAL DECISION AGENT
-# ============================================================
-
-def final_agent(state: RealEstateState):
-
-    prompt = f"""
-You are the Final Decision Agent.
-
-You are responsible for producing the final
-real estate recommendation.
-
-CLIENT REQUIREMENTS:
-
-Location:
-{state["location"]}
-
-Budget:
-${state["budget"]:,.0f}
-
-Property Type:
-{state["property_type"]}
-
-Minimum Bedrooms:
-{state["bedrooms"]}
-
-Down Payment:
-{state["down_payment"]}%
-
-
-PROPERTY ANALYSIS:
-
-{state["property_analysis"]}
-
-
-MARKET ANALYSIS:
-
-{state["market_analysis"]}
-
-
-LOCATION ANALYSIS:
-
-{state["location_analysis"]}
-
-
-FINANCIAL ANALYSIS:
-
-{state["financial_analysis"]}
-
-
-CREATE THE FINAL REPORT.
-
-Use this structure:
-
-1. Executive Summary
-
-2. Best Property
-
-3. Second Best Property
-
-4. Property Comparison
-
-5. Market Analysis
-
-6. Location Analysis
-
-7. Financial Analysis
-
-8. Advantages
-
-9. Risks
-
-10. Final Recommendation
-
-Be concise but useful.
-
-Do not invent facts.
-
-Mention that financial values are estimates
-and property information should be independently
-verified.
-"""
-
-    response = llm.invoke(prompt)
-
-    return {
-        "final_report": response.content
-    }
-
-
-# ============================================================
-# 13. CREATE LANGGRAPH
-# ============================================================
-
-workflow = StateGraph(RealEstateState)
-
-
-# Add agents as graph nodes
-
-workflow.add_node(
-    "property_agent",
-    property_agent
-)
-
-workflow.add_node(
-    "market_agent",
-    market_agent
-)
-
-workflow.add_node(
-    "location_agent",
-    location_agent
-)
-
-workflow.add_node(
-    "finance_agent",
-    finance_agent
-)
-
-workflow.add_node(
-    "final_agent",
-    final_agent
-)
-
-
-# ============================================================
-# 14. CONNECT AGENTS
-# ============================================================
-
-workflow.add_edge(
-    START,
-    "property_agent"
-)
-
-workflow.add_edge(
-    "property_agent",
-    "market_agent"
-)
-
-workflow.add_edge(
-    "market_agent",
-    "location_agent"
-)
-
-workflow.add_edge(
-    "location_agent",
-    "finance_agent"
-)
-
-workflow.add_edge(
-    "finance_agent",
-    "final_agent"
-)
-
-workflow.add_edge(
-    "final_agent",
-    END
-)
-
-
-# ============================================================
-# 15. COMPILE GRAPH
-# ============================================================
-
-graph = workflow.compile()
-
-print("LangGraph compiled successfully.")
-
-
-# ============================================================
-# 16. USER INPUT
-# ============================================================
-
-initial_state = {
-
-    "location": "Austin, Texas",
-
-    "budget": 650000,
-
-    "property_type": "Single Family Home",
-
-    "bedrooms": 3,
-
-    "down_payment": 20
-}
-
-
-# ============================================================
-# 17. RUN MULTI-AGENT SYSTEM
-# ============================================================
-
-print()
-print("=" * 70)
-print("🏠 REAL ESTATE MULTI-AGENT AI")
-print("=" * 70)
-
-print()
-print("Starting agents...")
-print()
-
-
-try:
-
-    result = graph.invoke(initial_state)
-
-    print()
-    print("=" * 70)
-    print("✅ MULTI-AGENT EXECUTION COMPLETED")
-    print("=" * 70)
-
-    print()
-    print("PROPERTY AGENT")
-    print("-" * 70)
-    print(result["property_analysis"])
-
-    print()
-    print("MARKET AGENT")
-    print("-" * 70)
-    print(result["market_analysis"])
-
-    print()
-    print("LOCATION AGENT")
-    print("-" * 70)
-    print(result["location_analysis"])
-
-    print()
-    print("FINANCIAL AGENT")
-    print("-" * 70)
-    print(result["financial_analysis"])
-
-    print()
-    print("=" * 70)
-    print("🏆 FINAL REAL ESTATE REPORT")
-    print("=" * 70)
-    print()
-
-    print(result["final_report"])
-
-except Exception as e:
-
-    print()
-    print("=" * 70)
-    print("❌ EXECUTION ERROR")
-    print("=" * 70)
-
-    print()
-    print("Error type:")
-    print(type(e).__name__)
-
-    print()
-    print("Error message:")
-    print(str(e))
+    try:
+        final_state = app_graph.invoke(initial_state)
+        return {
+            "ticker": final_state["ticker"],
+            "raw_fundamentals": final_state["financial_data"],
+            "equity_analysis": final_state["analysis_report"],
+            "risk_audit": final_state["risk_assessment"],
+            "portfolio_verdict": final_state["final_verdict"]
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:api", host="0.0.0.0", port=port, reload=False)
